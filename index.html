@@ -81,6 +81,7 @@ button,input{font:inherit;color:inherit}
   background:radial-gradient(circle,var(--acc) 0 42%,transparent 46%) 0 0/9px 9px;
   -webkit-mask-image:radial-gradient(circle at 50% 50%,#000 0 40%,transparent 70%);mask-image:radial-gradient(circle at 50% 50%,#000 0 40%,transparent 70%)}
 .mast-top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:.5rem 1rem}
+.mast-tools{display:inline-flex;flex-wrap:wrap;align-items:center;gap:.5rem .6rem}
 .sync{display:inline-flex;align-items:center;gap:.45rem;font-family:var(--f-type);font-size:var(--t-xs);letter-spacing:.04em;border:1.5px solid var(--ink);background:var(--sheet);padding:.2rem .6rem;cursor:default}
 .sync::before{content:"";width:.55rem;height:.55rem;border-radius:50%;background:var(--ink-soft)}
 .sync[data-state="shared"]::before{background:var(--green);box-shadow:0 0 0 2px color-mix(in srgb,var(--green) 30%,transparent)}
@@ -225,6 +226,7 @@ button,input{font:inherit;color:inherit}
 /* toast */
 .toast{position:fixed;z-index:60;left:50%;bottom:calc(18px + env(safe-area-inset-bottom,0px));translate:-50% 0;width:max-content;max-width:calc(100% - 32px);
   display:flex;align-items:center;gap:1rem;padding:.75rem 1rem;background:var(--ink);color:var(--on-ink);box-shadow:5px 5px 0 var(--acc);font-weight:600}
+.toast span{min-width:0;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text}
 .toast.show{animation:pop .25s ease-out}
 @keyframes pop{from{transform:translateY(10px);opacity:0}}
 .toast button{flex:none;background:none;border:0;padding:.2rem 0;cursor:pointer;font-weight:800;text-transform:uppercase;letter-spacing:.07em;
@@ -265,7 +267,10 @@ button,input{font:inherit;color:inherit}
   <header class="mast">
     <div class="mast-top">
       <span class="label">Vol. 1 · A running list for two</span>
-      <span class="sync" id="sync" data-state="connecting" role="status">Connecting…</span>
+      <span class="mast-tools">
+        <span class="sync" id="sync" data-state="connecting" role="status">Connecting…</span>
+        <button class="btn btn-sm btn-acc" type="button" id="share" hidden>Share the list</button>
+      </span>
     </div>
     <h1 class="logo"><span class="plate">Someday<br>Club</span><span class="plate plate-acc" aria-hidden="true">Someday<br>Club</span></h1>
     <p class="mast-sub"><span class="label">Members: 2</span><span class="label" id="tally">0 on the list · 0 done</span></p>
@@ -335,6 +340,7 @@ button,input{font:inherit;color:inherit}
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden><span id="toast-msg"></span><button type="button" id="toast-act" hidden>Undo</button></div>
 
+<script src="firebase-config.js"></script>
 <script>
 (() => {
   "use strict";
@@ -362,6 +368,9 @@ button,input{font:inherit;color:inherit}
   const ORDER = ["films", "dishes", "together"];
   const LS_DATA = "someday-club:lists:v1";
   const LS_TAB = "someday-club:tab";
+  const LS_CLUB = "someday-club:club";
+  const FIREBASE_VERSION = "12.19.0";
+  const CLUB_CODE = /^[a-z0-9]{8,40}$/i;
 
   const ICON = {
     grip: '<svg viewBox="0 0 12 20" width="12" height="20" aria-hidden="true"><g fill="currentColor"><rect x="1" y="2" width="3.4" height="3.4"/><rect x="7.6" y="2" width="3.4" height="3.4"/><rect x="1" y="8.3" width="3.4" height="3.4"/><rect x="7.6" y="8.3" width="3.4" height="3.4"/><rect x="1" y="14.6" width="3.4" height="3.4"/><rect x="7.6" y="14.6" width="3.4" height="3.4"/></g></svg>',
@@ -382,7 +391,7 @@ button,input{font:inherit;color:inherit}
   let mode = "connecting";          // connecting | shared | local | fallback
   let writable = true;
   let writableKnown = false;
-  let db = null, userApi = null, me = null;
+  let backend = null, userApi = null, me = null, club = null, fallbackTip = "";
   let editing = null, justAdded = null, pickedId = null, focusAfter = null;
   let dragging = false, renderQueued = false, pickTimer = null;
 
@@ -447,10 +456,77 @@ button,input{font:inherit;color:inherit}
     } catch {}
   }
 
+  /* Two shared backends with one shape: the claude.ai artifact store, or Firebase
+     Firestore when the page is hosted on its own. Docs come back as [{id, data}]. */
+  function artifactBackend(db) {
+    const docs = s => s.docs.filter(d => d.exists).map(d => ({ id: d.id, data: d.data() || {} }));
+    return {
+      newId: l => db.collection(l).doc().id,
+      set: (l, id, b) => db.collection(l).doc(id).set(b),
+      update: (l, id, p) => db.collection(l).doc(id).update(p),
+      remove: (l, id) => db.collection(l).doc(id).delete(),
+      fetch: l => db.collection(l).get().then(docs),
+      subscribe: (l, next, fail) => db.collection(l).onSnapshot(s => next(docs(s)), fail)
+    };
+  }
+
+  async function firebaseBackend(cfg, clubId) {
+    const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}/`;
+    const [{ initializeApp }, F] = await Promise.all([import(base + "firebase-app.js"), import(base + "firebase-firestore.js")]);
+    const { emulatorHost, emulatorPort, ...appConfig } = cfg;
+    const fs = F.getFirestore(initializeApp(appConfig));
+    if (emulatorHost) F.connectFirestoreEmulator(fs, emulatorHost, emulatorPort || 8080);
+    const col = l => F.collection(fs, "clubs", clubId, l);
+    const docs = s => s.docs.map(d => ({ id: d.id, data: d.data() || {} }));
+    // Firestore codes use dashes; the page branches on underscores.
+    const wrap = p => p.catch(e => { throw { code: String((e && e.code) || "unknown").replace(/-/g, "_"), message: e && e.message }; });
+    return {
+      newId: l => F.doc(col(l)).id,
+      set: (l, id, b) => wrap(F.setDoc(F.doc(col(l), id), b)),
+      update: (l, id, p) => wrap(F.updateDoc(F.doc(col(l), id), p)),
+      remove: (l, id) => wrap(F.deleteDoc(F.doc(col(l), id))),
+      fetch: l => wrap(F.getDocs(col(l)).then(docs)),
+      subscribe: (l, next, fail) => F.onSnapshot(col(l), s => next(docs(s)),
+        e => fail({ code: String((e && e.code) || "unknown").replace(/-/g, "_"), message: e && e.message }))
+    };
+  }
+
+  // Each list lives behind a private code in the link (?club=…), like "anyone with the link" sharing.
+  function resolveClub() {
+    let fromUrl = null, saved = null;
+    try { fromUrl = new URLSearchParams(location.search).get("club"); } catch {}
+    try { saved = localStorage.getItem(LS_CLUB); } catch {}
+    let code = fromUrl && CLUB_CODE.test(fromUrl) ? fromUrl : saved && CLUB_CODE.test(saved) ? saved : null;
+    if (!code) {
+      const abc = "abcdefghjkmnpqrstuvwxyz23456789", bytes = new Uint8Array(12);
+      crypto.getRandomValues(bytes);
+      code = Array.from(bytes, b => abc[b % abc.length]).join("");
+    }
+    try { localStorage.setItem(LS_CLUB, code); } catch {}
+    if (fromUrl !== code) {
+      try { const u = new URL(location.href); u.searchParams.set("club", code); history.replaceState(null, "", u.href); } catch {}
+    }
+    return code;
+  }
+  const clubLink = () => location.origin + location.pathname + "?club=" + club;
+
+  async function shareList() {
+    const url = clubLink();
+    if (navigator.share && matchMedia("(pointer: coarse)").matches) {
+      try { await navigator.share({ title: "Someday Club", text: "Our list of films, dishes and plans", url }); return; }
+      catch (e) { if (e && e.name === "AbortError") return; }
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("Link copied. Send it to your partner and you'll both edit the same lists.");
+    } catch {
+      toast("Copy this link and send it to your partner: " + url);
+    }
+  }
+
   async function remote(op, l, id, body) {
     if (mode !== "shared") { saveLocal(); return true; }
-    const ref = db.collection(l).doc(id);
-    const run = () => op === "set" ? ref.set(body) : op === "update" ? ref.update(body) : ref.delete();
+    const run = () => op === "set" ? backend.set(l, id, body) : op === "update" ? backend.update(l, id, body) : backend.remove(l, id);
     try { await run(); return true; }
     catch (err) {
       let e = err;
@@ -479,21 +555,26 @@ button,input{font:inherit;color:inherit}
     }
   }
 
-  function applySnap(l, snap) {
-    data[l] = snap.docs.filter(d => d.exists).map(d => ({ id: d.id, ...clean(d.data() || {}) }));
+  function applyDocs(l, docs) {
+    data[l] = docs.map(d => ({ id: d.id, ...clean(d.data) }));
     loaded[l] = true;
     render();
   }
   function resync(l) {
-    if (mode === "shared" && db) db.collection(l).get().then(s => applySnap(l, s)).catch(() => {});
+    if (mode === "shared" && backend) backend.fetch(l).then(docs => applyDocs(l, docs)).catch(() => {});
     else render();
   }
+  let loadErrorShown = false;
   function subscribeOne(l, retried) {
     if (unsubs[l]) unsubs[l]();
-    unsubs[l] = db.collection(l).onSnapshot(s => applySnap(l, s), e => {
+    unsubs[l] = backend.subscribe(l, docs => applyDocs(l, docs), e => {
       unsubs[l] = null;
       if (e && e.code === "unavailable" && !retried) { setTimeout(() => subscribeOne(l, true), 2000); return; }
       if (e && e.code === "revoked") { writable = false; editing = null; }
+      else if (e && e.code === "permission_denied" && !loadErrorShown) {
+        loadErrorShown = true;
+        toast("The database refused to load the list. Check that the rules in firestore.rules are published in Firebase.");
+      }
       loaded[l] = true;
       render();
     });
@@ -505,7 +586,7 @@ button,input{font:inherit;color:inherit}
     const list = active(l);
     const rank = !list.length ? 0 : top ? list[0].rank - 1 : list[list.length - 1].rank + 1;
     const body = { title, note, link, rank, done: false, doneAt: null, addedBy: me, createdAt: Date.now() };
-    const id = mode === "shared" ? db.collection(l).doc().id : "l" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const id = mode === "shared" ? backend.newId(l) : "l" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     data[l].push({ id, ...body });
     justAdded = id;
     setTimeout(() => { if (justAdded === id) justAdded = null; }, 1200);
@@ -708,7 +789,7 @@ button,input{font:inherit;color:inherit}
       a.href = it.link; a.target = "_blank"; a.rel = "noopener noreferrer";
       meta.append(a);
     }
-    if (it.addedBy && mode === "shared") meta.append(whoChip(it.addedBy));
+    if (it.addedBy && mode === "shared" && userApi) meta.append(whoChip(it.addedBy));
     if (meta.childNodes.length) body.append(meta);
     li.append(body);
 
@@ -871,15 +952,16 @@ button,input{font:inherit;color:inherit}
     const s = $("#sync"), foot = $("#foot-mode");
     let state = mode, text, tip = "";
     if (mode === "connecting") text = "Connecting…";
-    else if (mode === "shared" && writable) { text = "Shared · live"; tip = "Changes show up for both of you right away."; }
+    else if (mode === "shared" && writable) { text = "Shared · live"; tip = club ? "Anyone with this page's link sees and edits these lists." : "Changes show up for both of you right away."; }
     else if (mode === "shared") { state = "readonly"; text = "View only"; tip = "You can look but not change things. Ask the owner for edit access."; }
-    else if (mode === "fallback") { text = "This device only"; tip = "The shared list isn't available here, so changes are saved in this browser only. Sign in to claude.ai to use the shared list."; }
-    else { text = "Saved in this browser"; tip = "This copy keeps your lists in this browser only. Use the shared link to edit together."; }
+    else if (mode === "fallback") { text = "This device only"; tip = fallbackTip; }
+    else { text = "Saved in this browser"; tip = "This copy keeps your lists in this browser only."; }
     s.dataset.state = state;
     s.textContent = text;
     s.title = tip;
-    foot.hidden = mode === "connecting" || (mode === "shared" && writable);
+    foot.hidden = mode === "connecting" || (mode === "shared" && writable && !club);
     foot.textContent = tip;
+    $("#share").hidden = !(club && mode === "shared");
   }
 
   function render() {
@@ -1043,6 +1125,7 @@ button,input{font:inherit;color:inherit}
     });
 
     $("#pick").addEventListener("click", pick);
+    $("#share").addEventListener("click", shareList);
 
     $("#list").addEventListener("pointerdown", startDrag);
     $("#list").addEventListener("click", e => {
@@ -1071,11 +1154,20 @@ button,input{font:inherit;color:inherit}
     });
   }
 
-  function startLocal(kind) {
+  function startLocal(kind, tip) {
     mode = kind;
+    fallbackTip = tip || "";
+    club = null;
     loadLocal();
     ORDER.forEach(l => { loaded[l] = true; });
     render();
+  }
+
+  function goShared(b) {
+    backend = b;
+    mode = "shared";
+    render();
+    ORDER.forEach(l => subscribeOne(l));
   }
 
   function boot() {
@@ -1086,15 +1178,24 @@ button,input{font:inherit;color:inherit}
     wire();
 
     const C = window.claude;
-    if (!C || typeof C.use !== "function") { startLocal("local"); return; }
+    const fbConfig = window.SOMEDAY_FIREBASE_CONFIG;
+    if (!C || typeof C.use !== "function") {
+      if (!fbConfig || typeof fbConfig !== "object") { startLocal("local"); return; }
+      writableKnown = true;
+      club = resolveClub();
+      render();
+      firebaseBackend(fbConfig, club).then(goShared).catch(() => {
+        startLocal("fallback", "Couldn't reach the shared list, so changes are saved in this browser for now. Reload to try again.");
+      });
+      return;
+    }
     render();
     Promise.all([
       C.use("db").catch(() => null),
       C.use("user").catch(() => null)
     ]).then(async ([d, u]) => {
       userApi = u;
-      if (!d) { startLocal("fallback"); return; }
-      db = d;
+      if (!d) { startLocal("fallback", "The shared list isn't available here, so changes are saved in this browser only. Sign in to claude.ai to use the shared list."); return; }
       if (u) {
         try { me = await u.id(); } catch {}
         try {
@@ -1103,9 +1204,7 @@ button,input{font:inherit;color:inherit}
           if (can === false) writable = false;
         } catch {}
       }
-      mode = "shared";
-      render();
-      ORDER.forEach(l => subscribeOne(l));
+      goShared(artifactBackend(d));
     });
   }
 
